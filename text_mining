@@ -2,3 +2,132 @@ import os
 import pandas as pd
 import json
 from tqdm import tqdm
+import jieba
+from collections import Counter
+
+ORIGINAL_DATA = pd.read_pickle('udn_news_20201109.pickle')
+
+def do_filter(data, cate, number):
+    DATA = ORIGINAL_DATA
+    DATA['CONTENT_len'] = DATA['CONTENT'].apply(lambda x:len(x))
+    DATA = DATA[ (DATA['CONTENT_len']<= number) 
+                & (DATA["CATE"]!= "{}".format(cate)) ].reset_index().drop(columns = ["index"])
+    return DATA
+
+import requests
+req = requests.get('https://raw.githubusercontent.com/fxsjy/jieba/master/test/userdict.txt')
+open('userdict.txt', 'wb').write(req.content)
+req = requests.get('https://github.com/fxsjy/jieba/raw/master/extra_dict/dict.txt.big')
+open('dict.txt.big', 'wb').write(req.content)   
+
+jieba.load_userdict('userdict.txt')
+jieba.set_dictionary('dict.txt.big')
+
+def do_JIEBA_NA(data):
+    # 斷詞
+    J_sents_annotated_ws = []
+
+    for sent in data:
+        J_sents_annotated_ws.append(jieba.lcut(sent, cut_all=False)) 
+    DATA['JIEBA_NA'] = pd.Series(J_sents_annotated_ws)
+
+    num_top = 10 # how may frequent words will be removed
+    # compute word counting
+    cnt = Counter([word for sent in DATA["JIEBA_NA"] for word in sent])
+    FREQWORDS = {w:wc for (w, wc) in cnt.most_common(num_top)}
+    l_ = list(FREQWORDS.keys())
+    #print("FREQWORDS ->", FREQWORDS)
+
+    # 將前10名最常出現的詞移除
+    for i in l_:
+        DATA['JIEBA_NA'] = DATA['JIEBA_NA'].apply(lambda row:[val.replace("{}".format(i), "") for val in row])
+    
+    return DATA['JIEBA_NA']
+    
+from ckiptagger import WS
+from ckiptagger import POS
+from ckiptagger import NER
+
+from pathlib import Path
+path = str(Path.home()) + '/ckip/'
+CKIP_WS = WS(path + "/data", disable_cuda=False) # 斷詞
+CKIP_POS = POS(path + "/data", disable_cuda=False) # 詞性
+CKIP_NER = NER(path + "/data", disable_cuda=False) # 命名實體辨識
+
+# 篩 NE 函數
+def reform_ner(sent, filter_types):
+    sent = sorted(sent, key = lambda s : s[0])
+    reform_ner_sentt = []
+    for i,(start_idx,end_index,ner_type,word)in enumerate(sent):
+        if ner_type in filter_types:
+            reform_ner_sentt.append(word)
+    return reform_ner_sentt
+    
+ def do_CKIP_NER(data):
+    # 進⾏斷詞
+    C_sents_annotated_ws = CKIP_WS(data) 
+    # 詞性
+    C_sents_annotated_pos = CKIP_POS(C_sents_annotated_ws)
+    # 調⽤剛才完成的斷詞結果、詞性標註結果
+    C_sents_annotated_ner = CKIP_NER(C_sents_annotated_ws, C_sents_annotated_pos) 
+    
+    
+    #根據NE類別篩選字詞 :「人物」、「組織」、「行政區」和「金錢」
+    filter_types = ['PERSON','ORG','GPE','MONEY']
+    # Do filter by NE
+    C_sents_filter_ner = [reform_ner(sent, filter_types) for sent in C_sents_annotated_ner]
+    
+    
+    DATA['CKIP_NER'] = pd.Series(C_sents_filter_ner)
+    
+    return DATA['CKIP_NER']  
+    
+def do_find_frequent_rare_word(data):
+    num_top = 10 
+    # compute word counting
+    cnt = Counter([word for sent in data for word in sent])
+    FREQWORDS = cnt.most_common(num_top)
+    
+    num_rare = 20
+    cnt1 = Counter([word for sent in data for word in sent])
+    RAREWORDS = cnt1.most_common()[:-num_rare-1:-1]
+    
+    frequent_rare_words = FREQWORDS + RAREWORDS
+    return frequent_rare_words
+    
+from mlxtend.preprocessing import TransactionEncoder
+from mlxtend.frequent_patterns import apriori
+from mlxtend.frequent_patterns import association_rules 
+
+def do_arm(data, min_sup, min_conf, min_lift, num_antecedent, num_consequent):
+    te = TransactionEncoder()  # 轉成矩陣one_hot_encoding
+    te_ary = te.fit(data).transform(data)
+    df = pd.DataFrame(te_ary, columns= te.columns_) 
+    
+    frequent_itemsets = apriori(df, min_support = min_sup, use_colnames=True)
+
+    association_rules_by_conf = association_rules(frequent_itemsets, min_threshold=0)
+    association_rules_by_conf["antecedent_len"] = association_rules_by_conf["antecedents"].apply(lambda x: len(x))
+    association_rules_by_conf["consequent_len"] = association_rules_by_conf["consequents"].apply(lambda x: len(x))
+
+    result = association_rules_by_conf[ (association_rules_by_conf['support'] >= min_sup) &
+                                       (association_rules_by_conf['confidence'] > min_conf) &
+                                       (association_rules_by_conf['lift'] > min_lift) &
+                                        (association_rules_by_conf['antecedent_len'] == num_antecedent) &
+                                       (association_rules_by_conf['consequent_len'] == num_consequent) &
+                                       (association_rules_by_conf['lift'] > min_lift)]
+    return result
+    
+min_sup = 0.01  # support
+min_conf = 0.5  # confidence
+min_lift = 10.0  # lift
+num_antecedent =  1  # number of antencedent
+num_consequent =  2  # number of consequent  
+
+rules = do_arm(DATA['CKIP_NER'], 
+                           min_sup=min_sup,
+                           min_conf=min_conf, 
+                           min_lift=min_lift, 
+                           num_antecedent=num_antecedent,
+                           num_consequent=num_consequent)
+
